@@ -36,10 +36,14 @@ MODEL = "claude-opus-4-7"
 MAX_ITERATIONS = 8
 RUN_TTL_DAYS = 30
 
+PROCESSOR_FUNCTION_NAME = f"CloudVisionOps-RekognitionProcessor-{os.environ.get('STAGE', 'dev')}"
+MAX_AUTO_CONCURRENCY = 100  # hard cap on autonomous concurrency increases
+
 dynamodb = boto3.resource("dynamodb", region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
 cloudwatch = boto3.client("cloudwatch", region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
 sqs = boto3.client("sqs", region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
 sns = boto3.client("sns", region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+lambda_client = boto3.client("lambda", region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
 
 
 # ---- Tool definitions (sent to Claude as JSON schema) ----
@@ -146,6 +150,40 @@ TOOLS = [
                 "message": {"type": "string", "maxLength": 2000},
             },
             "required": ["severity", "subject", "message"],
+        },
+    },
+    {
+        "name": "get_lambda_concurrency",
+        "description": (
+            "Returns the current reservedConcurrentExecutions for the Rekognition processor Lambda, "
+            "plus recent throttle count from CloudWatch. Use this before deciding whether to scale."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "scale_lambda_concurrency",
+        "description": (
+            "Increases the reservedConcurrentExecutions for the Rekognition processor Lambda. "
+            "ONLY call this when: (1) DLQ depth is high, AND (2) failure rate is LOW (< 5%) — "
+            "meaning the backlog is a throughput/throttle problem, not an error problem. "
+            "Do NOT call during high failure rates — scaling into an error storm makes it worse. "
+            f"Hard cap: {MAX_AUTO_CONCURRENCY}. Always call get_lambda_concurrency first."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "new_concurrency": {
+                    "type": "integer",
+                    "description": f"New reservedConcurrentExecutions value (10–{MAX_AUTO_CONCURRENCY}).",
+                    "minimum": 10,
+                    "maximum": MAX_AUTO_CONCURRENCY,
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why you are scaling — logged in the run trace.",
+                },
+            },
+            "required": ["new_concurrency", "reason"],
         },
     },
     {
@@ -341,6 +379,54 @@ def tool_publish_alert(severity: str, subject: str, message: str) -> dict:
     return {"published": True, "severity": severity, "subject": subject}
 
 
+def tool_get_lambda_concurrency() -> dict:
+    try:
+        resp = lambda_client.get_function_concurrency(FunctionName=PROCESSOR_FUNCTION_NAME)
+        current = resp.get("ReservedConcurrentExecutions", "unreserved")
+    except Exception as e:
+        current = f"error: {e}"
+
+    # Pull throttle count from CloudWatch for the last hour
+    now = datetime.now(timezone.utc)
+    try:
+        throttle_resp = cloudwatch.get_metric_statistics(
+            Namespace="AWS/Lambda",
+            MetricName="Throttles",
+            Dimensions=[{"Name": "FunctionName", "Value": PROCESSOR_FUNCTION_NAME}],
+            StartTime=now - timedelta(hours=1),
+            EndTime=now,
+            Period=3600,
+            Statistics=["Sum"],
+        )
+        throttles = int(sum(d["Sum"] for d in throttle_resp.get("Datapoints", [])))
+    except Exception:
+        throttles = -1
+
+    return {
+        "functionName": PROCESSOR_FUNCTION_NAME,
+        "reservedConcurrentExecutions": current,
+        "throttlesLastHour": throttles,
+    }
+
+
+def tool_scale_lambda_concurrency(new_concurrency: int, reason: str) -> dict:
+    capped = min(new_concurrency, MAX_AUTO_CONCURRENCY)
+    try:
+        lambda_client.put_function_concurrency(
+            FunctionName=PROCESSOR_FUNCTION_NAME,
+            ReservedConcurrentExecutions=capped,
+        )
+        logger.info(json.dumps({
+            "event": "auto_remediation_scale",
+            "function": PROCESSOR_FUNCTION_NAME,
+            "newConcurrency": capped,
+            "reason": reason,
+        }))
+        return {"scaled": True, "newConcurrency": capped, "reason": reason}
+    except Exception as e:
+        return {"scaled": False, "error": str(e)}
+
+
 def tool_write_recommendation(
     category: str,
     severity: str,
@@ -384,6 +470,13 @@ def dispatch_tool(name: str, inputs: dict, run_id: str) -> Any:
         return tool_get_dlq_depth()
     if name == "get_cold_start_rate":
         return tool_get_cold_start_rate()
+    if name == "get_lambda_concurrency":
+        return tool_get_lambda_concurrency()
+    if name == "scale_lambda_concurrency":
+        return tool_scale_lambda_concurrency(
+            new_concurrency=inputs["new_concurrency"],
+            reason=inputs.get("reason", ""),
+        )
     if name == "trigger_dlq_replay":
         return tool_trigger_dlq_replay(
             batch_size=inputs.get("batch_size", 5),
@@ -421,10 +514,16 @@ def run_agent(run_id: str) -> dict:
         "intelligence pipeline on AWS. Your job is to diagnose the current health of the pipeline "
         "and take targeted corrective actions when warranted.\n\n"
         "Start by calling get_pipeline_health to get a broad view, then drill into specific signals "
-        "using the other tools. Only trigger DLQ replay if the DLQ has messages AND you have "
-        "confirmed the root cause is not an active outage. Only publish an alert for HIGH severity "
-        "findings. Always write at least one recommendation summarizing what you found, even if "
-        "everything is healthy.\n\n"
+        "using the other tools.\n\n"
+        "Auto-remediation rules (follow these exactly):\n"
+        "- High DLQ depth AND low failure rate (< 5%): this is a throughput/throttle problem. "
+        "Call get_lambda_concurrency, then scale_lambda_concurrency to increase reserved concurrency. "
+        "Do NOT exceed 100.\n"
+        "- High DLQ depth AND high failure rate (>= 5%): this is an error problem, not a throughput "
+        "problem. Do NOT scale concurrency — scaling into errors makes it worse. Publish an alert.\n"
+        "- Only trigger DLQ replay if DLQ has messages AND the root cause is confirmed resolved.\n"
+        "- Only publish an alert for HIGH severity findings.\n"
+        "- Always write at least one recommendation summarizing what you found.\n\n"
         "Be concise. Reason step-by-step. When done, output a brief plain-text summary of what "
         "you found and what you did."
     )
@@ -482,7 +581,7 @@ def run_agent(run_id: str) -> dict:
                 "result": result,
             })
 
-            if tool_name in ("trigger_dlq_replay", "publish_alert", "write_recommendation"):
+            if tool_name in ("trigger_dlq_replay", "publish_alert", "write_recommendation", "scale_lambda_concurrency"):
                 actions_taken.append(f"{tool_name}: {json.dumps(tool_inputs, default=str)[:200]}")
 
             tool_results.append({

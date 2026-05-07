@@ -1,5 +1,6 @@
 import * as cdk from 'aws-cdk-lib';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
+import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import { Construct } from 'constructs';
@@ -9,6 +10,7 @@ interface ApiStackProps extends cdk.StackProps {
   uploadUrlHandler: lambda.Function;
   metadataQueryHandler: lambda.Function;
   agenticOps: lambda.Function;
+  userPool: cognito.UserPool;
 }
 
 export class ApiStack extends cdk.Stack {
@@ -17,7 +19,7 @@ export class ApiStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: ApiStackProps) {
     super(scope, id, props);
 
-    const { stage, uploadUrlHandler, metadataQueryHandler, agenticOps } = props;
+    const { stage, uploadUrlHandler, metadataQueryHandler, agenticOps, userPool } = props;
 
     const accessLogs = new logs.LogGroup(this, 'ApiAccessLogs', {
       logGroupName: `/aws/apigateway/CloudVisionOps-${stage}`,
@@ -37,7 +39,7 @@ export class ApiStack extends cdk.Stack {
         throttlingRateLimit: 50,
         accessLogDestination: new apigateway.LogGroupLogDestination(accessLogs),
         accessLogFormat: apigateway.AccessLogFormat.jsonWithStandardFields(),
-        tracingEnabled: true, // X-Ray tracing on API Gateway
+        tracingEnabled: true,
       },
       defaultCorsPreflightOptions: {
         allowOrigins: apigateway.Cors.ALL_ORIGINS,
@@ -47,7 +49,20 @@ export class ApiStack extends cdk.Stack {
       },
     });
 
-    // Request validator — enforces schema at the gateway before Lambda is even invoked
+    // Cognito JWT authorizer — validates Bearer token on all protected routes
+    const authorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'CognitoAuthorizer', {
+      cognitoUserPools: [userPool],
+      authorizerName: `CloudVisionOps-CognitoAuthorizer-${stage}`,
+      identitySource: 'method.request.header.Authorization',
+      resultsCacheTtl: cdk.Duration.minutes(5),
+    });
+
+    const cognitoAuth = {
+      authorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    };
+
+    // Request validator — enforces schema at the gateway before Lambda is invoked
     const requestValidator = new apigateway.RequestValidator(this, 'RequestValidator', {
       restApi: this.api,
       requestValidatorName: 'validate-body-and-params',
@@ -55,13 +70,14 @@ export class ApiStack extends cdk.Stack {
       validateRequestParameters: true,
     });
 
-    // POST /uploads/presign — returns pre-signed S3 URL for direct browser upload
+    // POST /uploads/presign — protected: only authenticated users can get upload URLs
     const uploads = this.api.root.addResource('uploads');
     const presign = uploads.addResource('presign');
     presign.addMethod('POST', new apigateway.LambdaIntegration(uploadUrlHandler, {
       proxy: true,
       timeout: cdk.Duration.seconds(10),
     }), {
+      ...cognitoAuth,
       requestValidator,
       requestModels: {
         'application/json': new apigateway.Model(this, 'PresignRequestModel', {
@@ -85,28 +101,28 @@ export class ApiStack extends cdk.Stack {
       },
     });
 
-    // GET /images — list recent images (paginated)
+    // GET /images — protected
     const images = this.api.root.addResource('images');
-    images.addMethod('GET', new apigateway.LambdaIntegration(metadataQueryHandler, { proxy: true }));
+    images.addMethod('GET', new apigateway.LambdaIntegration(metadataQueryHandler, { proxy: true }), cognitoAuth);
 
-    // GET /images/{imageId} — get single image metadata
+    // GET /images/{imageId} — protected
     const image = images.addResource('{imageId}');
-    image.addMethod('GET', new apigateway.LambdaIntegration(metadataQueryHandler, { proxy: true }));
+    image.addMethod('GET', new apigateway.LambdaIntegration(metadataQueryHandler, { proxy: true }), cognitoAuth);
 
-    // GET /metrics/summary — aggregated pipeline metrics
+    // GET /metrics/summary — protected
     const metrics = this.api.root.addResource('metrics');
     const summary = metrics.addResource('summary');
-    summary.addMethod('GET', new apigateway.LambdaIntegration(metadataQueryHandler, { proxy: true }));
+    summary.addMethod('GET', new apigateway.LambdaIntegration(metadataQueryHandler, { proxy: true }), cognitoAuth);
 
-    // GET /agent/runs — latest agentic ops run history
-    // POST /agent/runs/trigger — manually trigger an agentic ops run
+    // GET /agent/runs — protected
+    // POST /agent/runs/trigger — protected
     const agentResource = this.api.root.addResource('agent');
     const agentRunsResource = agentResource.addResource('runs');
-    agentRunsResource.addMethod('GET', new apigateway.LambdaIntegration(metadataQueryHandler));
+    agentRunsResource.addMethod('GET', new apigateway.LambdaIntegration(metadataQueryHandler), cognitoAuth);
     const agentTriggerResource = agentRunsResource.addResource('trigger');
-    agentTriggerResource.addMethod('POST', new apigateway.LambdaIntegration(agenticOps));
+    agentTriggerResource.addMethod('POST', new apigateway.LambdaIntegration(agenticOps), cognitoAuth);
 
-    // GET /health
+    // GET /health — open, no auth (used by CI smoke tests and load balancer checks)
     const health = this.api.root.addResource('health');
     health.addMethod('GET', new apigateway.MockIntegration({
       integrationResponses: [{ statusCode: '200', responseTemplates: { 'application/json': '{"status":"ok"}' } }],
@@ -116,7 +132,6 @@ export class ApiStack extends cdk.Stack {
       methodResponses: [{ statusCode: '200' }],
     });
 
-    // Usage plan with API key for rate limiting
     const usagePlan = new apigateway.UsagePlan(this, 'UsagePlan', {
       name: `CloudVisionOps-UsagePlan-${stage}`,
       throttle: { burstLimit: 100, rateLimit: 50 },

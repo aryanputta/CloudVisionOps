@@ -89,13 +89,17 @@ export class LambdaStack extends cdk.Stack {
     uploadBucket.grantPut(this.uploadUrlHandler);
     imageMetadataTable.grantWriteData(this.uploadUrlHandler);
 
-    // Rekognition Processor — core ML pipeline: reads S3, calls Rekognition, writes DynamoDB
-    // 1024 MB: Rekognition calls are I/O-bound but higher memory speeds up cold starts significantly
-    this.rekognitionProcessor = new lambdaNodejs.NodejsFunction(this, 'RekognitionProcessor', {
+    // Rekognition Processor — container image Lambda.
+    // OCI image eliminates node_modules cold-start load time: AWS SDKs are pre-installed
+    // in the base image and externalized from the bundle, so the only payload is the
+    // compiled business logic (~50KB). Build context is backend/ so the Dockerfile
+    // can reach shared/utils.ts without copying it into the lambda directory.
+    this.rekognitionProcessor = new lambda.DockerImageFunction(this, 'RekognitionProcessor', {
       functionName: `CloudVisionOps-RekognitionProcessor-${stage}`,
-      entry: path.join(LAMBDA_ROOT, 'rekognition-processor/index.ts'),
-      handler: 'handler',
-      runtime: lambda.Runtime.NODEJS_20_X,
+      code: lambda.DockerImageCode.fromImageAsset(
+        path.join(__dirname, '../../../backend'),
+        { file: 'lambdas/rekognition-processor/Dockerfile' }
+      ),
       memorySize: 1024,
       timeout: cdk.Duration.seconds(60),
       environment: {
@@ -103,11 +107,9 @@ export class LambdaStack extends cdk.Stack {
         IDEMPOTENCY_TABLE: `CloudVisionOps-Idempotency-${stage}`,
         CIRCUIT_BREAKER_TABLE: `CloudVisionOps-Idempotency-${stage}`,
       },
-      layers: [utilsLayer],
       logRetention: logs.RetentionDays.ONE_MONTH,
       tracing: lambda.Tracing.ACTIVE,
       reservedConcurrentExecutions: 50,
-      bundling: { minify: true, sourceMap: true },
       deadLetterQueue: dlq,
     });
 
@@ -302,6 +304,13 @@ export class LambdaStack extends cdk.Stack {
       effect: iam.Effect.ALLOW,
       actions: ['cloudwatch:GetMetricStatistics', 'cloudwatch:ListMetrics'],
       resources: ['*'],
+    }));
+
+    // Auto-remediation: agent can read and set concurrency on the processor only
+    this.agenticOps.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: ['lambda:GetFunctionConcurrency', 'lambda:PutFunctionConcurrency'],
+      resources: [this.rekognitionProcessor.functionArn],
     }));
 
     // Read ANTHROPIC_API_KEY from SSM Parameter Store at deploy time
