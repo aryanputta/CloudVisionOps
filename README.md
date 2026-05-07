@@ -307,39 +307,3 @@ cloudvisionops/
     deploy-dev.yml            CDK deploy to dev on merge to main
     benchmark.yml             Benchmark run (manual trigger)
 ```
-
----
-
-## Resume Bullets
-
-**Built CloudVisionOps**, a serverless AI image intelligence pipeline on AWS using Lambda, S3, DynamoDB, Rekognition, EventBridge Pipes, and SQS FIFO, processing images through an event-driven architecture with idempotent execution, duplicate hash detection, and structured failure recovery — deployed entirely via CDK TypeScript across 7 independently versioned stacks.
-
-**Designed and implemented multi-layer reliability engineering** including DynamoDB conditional write idempotency, exponential backoff with full jitter on all retries, SQS FIFO dead letter queue with configurable maxReceiveCount, DLQ Replay Lambda for traceable job recovery, and EventBridge Pipes server-side filtering — benchmarked from p95=4,200ms to p95=2,100ms through Lambda memory tuning.
-
-**Built an autonomous Python ops agent** on a 15-minute EventBridge schedule that reads DynamoDB and CloudWatch metrics to classify eight anomaly categories (latency spike, DLQ backlog, high failure rate, duplicate surge, hot partition risk) and writes structured recommendations with confidence scores, enabling self-service operational visibility without manual dashboards.
-
----
-
-## 30-Second Recruiter Pitch
-
-I built CloudVisionOps to demonstrate how serverless AI systems behave under real event-driven workloads. Instead of just uploading images and calling Rekognition, I focused on the distributed systems problems: duplicate S3 events that re-trigger ML calls, retries without idempotency, dead letter queues that go unmonitored, cold starts that inflate p99 latency, and cost overruns from unnecessary Rekognition invocations. The system shows I can build cloud-native infrastructure that is scalable, measurable, and recoverable — with every failure mode classified, logged, and testable.
-
----
-
-## LinkedIn Summary
-
-CloudVisionOps is a serverless image intelligence pipeline I built on AWS to solve real distributed systems problems, not just the happy path. The system routes image uploads through API Gateway and S3 pre-signed URLs, triggers Lambda-based Rekognition analysis, streams results through DynamoDB and EventBridge Pipes to downstream analytics and failure monitors, and handles failures through SQS FIFO dead letter queues with a replay mechanism. An autonomous Python ops agent runs on a schedule to detect latency spikes, duplicate surges, DLQ backlogs, and hot partition risks — writing structured recommendations to DynamoDB. Benchmarked to p95 under 2.1 seconds with 1024 MB Lambda and full idempotency guarantees.
-
----
-
-## Future Improvements
-
-- **AWS Step Functions**: Replace the processor Lambda with a Step Functions state machine for more granular retry control and visual workflow debugging
-- **Amazon Cognito**: Add user authentication with JWT validation at API Gateway
-- **DAX (DynamoDB Accelerator)**: Add read cache for hot metadata queries (image detail panel)
-- **Kinesis Data Streams**: Replace DynamoDB Streams with Kinesis for higher fan-out throughput
-- **Container image Lambda**: Package processor as OCI image to eliminate cold start from dependency loading
-- **Lambda SnapStart**: Evaluate for Java-based Rekognition client to reduce p99 cold start
-- **Automated remediation in Ops Agent**: Add auto-scaling triggers based on DLQ depth threshold
-- **Multi-region active-passive**: Route uploads to closest region; replicate metadata via DynamoDB Global Tables
-- **S3 Object Lambda**: Pre-process images (resize, normalize) before Rekognition call to improve confidence scores
