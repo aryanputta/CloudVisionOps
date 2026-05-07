@@ -1,0 +1,93 @@
+name: Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: 'Number of images to upload'
+        required: true
+        default: '100'
+        type: string
+      workers:
+        description: 'Concurrent upload workers'
+        required: true
+        default: '10'
+        type: string
+      include_duplicates:
+        description: 'Include duplicate uploads (every 10th image)'
+        required: false
+        default: false
+        type: boolean
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, staging]
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  benchmark:
+    name: Benchmark (${{ github.event.inputs.batch_size }} images)
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Python dependencies
+        run: pip install boto3 requests
+
+      - name: Run benchmark
+        run: |
+          ARGS="--batch ${{ github.event.inputs.batch_size }} --workers ${{ github.event.inputs.workers }}"
+          if [ "${{ github.event.inputs.include_duplicates }}" = "true" ]; then
+            ARGS="$ARGS --include-duplicates"
+          fi
+          python3 benchmarks/upload_benchmark.py $ARGS
+        env:
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          IMAGE_METADATA_TABLE: CloudVisionOps-ImageMetadata-${{ github.event.inputs.environment }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: |
+            benchmarks/latency_results.csv
+            benchmarks/cost_results.csv
+            benchmarks/failure_results.csv
+            benchmarks/duplicate_detection_results.csv
+            benchmarks/benchmark_summary.json
+
+      - name: Print summary
+        run: |
+          if [ -f benchmarks/benchmark_summary.json ]; then
+            cat benchmarks/benchmark_summary.json
+          fi
+
+      - name: Commit benchmark results
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add benchmarks/*.csv benchmarks/benchmark_summary.json || true
+          git diff --staged --quiet || git commit -m "benchmark: results for batch=${{ github.event.inputs.batch_size }} run=${{ github.run_id }}"
+          git push || true

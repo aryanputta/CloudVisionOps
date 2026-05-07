@@ -1,0 +1,47 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-gray-950 text-gray-100 font-mono;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-gray-900 border border-gray-800 rounded-lg p-4;
+  }
+
+  .badge-processed {
+    @apply bg-emerald-900 text-emerald-300 text-xs px-2 py-0.5 rounded font-semibold;
+  }
+
+  .badge-failed {
+    @apply bg-red-900 text-red-300 text-xs px-2 py-0.5 rounded font-semibold;
+  }
+
+  .badge-duplicate {
+    @apply bg-yellow-900 text-yellow-300 text-xs px-2 py-0.5 rounded font-semibold;
+  }
+
+  .badge-pending {
+    @apply bg-gray-700 text-gray-300 text-xs px-2 py-0.5 rounded font-semibold;
+  }
+
+  .badge-processing {
+    @apply bg-blue-900 text-blue-300 text-xs px-2 py-0.5 rounded font-semibold;
+  }
+
+  .severity-high {
+    @apply text-red-400;
+  }
+
+  .severity-medium {
+    @apply text-yellow-400;
+  }
+
+  .severity-low {
+    @apply text-blue-400;
+  }
+}

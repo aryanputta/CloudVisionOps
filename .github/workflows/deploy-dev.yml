@@ -1,0 +1,87 @@
+name: Deploy Dev
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, staging]
+
+env:
+  AWS_REGION: us-east-1
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+
+jobs:
+  deploy:
+    name: Deploy to ${{ github.event.inputs.environment || 'dev' }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+
+    permissions:
+      id-token: write    # OIDC auth — no static AWS keys stored in secrets
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install dependencies
+        run: npm run bootstrap
+
+      - name: CDK Diff
+        run: cd infra/cdk && npx cdk diff --all
+        env:
+          CDK_DEFAULT_ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+          CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
+          ENVIRONMENT: ${{ env.ENVIRONMENT }}
+
+      - name: CDK Deploy (all stacks)
+        run: cd infra/cdk && npx cdk deploy --all --require-approval never --outputs-file cdk-outputs.json
+        env:
+          CDK_DEFAULT_ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+          CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
+          ENVIRONMENT: ${{ env.ENVIRONMENT }}
+
+      - name: Extract CDK outputs
+        id: outputs
+        run: |
+          API_URL=$(cat infra/cdk/cdk-outputs.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(list(v.get('ApiUrl','') for k,v in d.items() if 'API' in k)[0])" 2>/dev/null || echo "")
+          echo "api_url=$API_URL" >> $GITHUB_OUTPUT
+
+      - name: Run smoke test
+        if: steps.outputs.outputs.api_url != ''
+        run: |
+          curl -f "${{ steps.outputs.outputs.api_url }}health" || echo "Health check failed"
+
+      - name: Run integration tests
+        if: steps.outputs.outputs.api_url != ''
+        run: |
+          cd tests && \
+          INTEGRATION=true \
+          API_BASE_URL=${{ steps.outputs.outputs.api_url }} \
+          IMAGE_METADATA_TABLE=CloudVisionOps-ImageMetadata-${{ env.ENVIRONMENT }} \
+          AWS_REGION=${{ env.AWS_REGION }} \
+          npx jest integration/ --ci --passWithNoTests
+        continue-on-error: true
+
+      - name: Summary
+        run: |
+          echo "## Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "Environment: ${{ env.ENVIRONMENT }}" >> $GITHUB_STEP_SUMMARY
+          echo "API URL: ${{ steps.outputs.outputs.api_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "Region: ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY

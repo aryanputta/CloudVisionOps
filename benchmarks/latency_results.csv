@@ -1,0 +1,1 @@
+image_id,status,round_trip_ms,presign_ms,s3_upload_ms,processing_ms,dominant_label,confidence_score,label_count,cold_start,retry_count,timestamp

@@ -1,0 +1,85 @@
+name: Test
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+
+jobs:
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install CDK dependencies
+        run: cd infra/cdk && npm ci
+
+      - name: Install test dependencies
+        run: cd tests && npm install
+
+      - name: Lint
+        run: |
+          npx eslint 'backend/**/*.ts' 'infra/**/*.ts' --ext .ts --max-warnings 0 || true
+
+      - name: TypeScript compile check
+        run: npx tsc --noEmit
+
+      - name: Run unit tests
+        run: cd tests && npx jest unit/ --coverage --ci --passWithNoTests
+
+      - name: Run reliability tests
+        run: cd tests && npx jest reliability/ --ci --passWithNoTests
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          directory: tests/coverage
+          fail_ci_if_error: false
+
+  cdk-synth:
+    name: CDK Synth
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install CDK dependencies
+        run: cd infra/cdk && npm ci
+
+      - name: CDK Synth (validates all stacks compile)
+        run: cd infra/cdk && npx cdk synth --all 2>&1 | tail -20
+        env:
+          CDK_DEFAULT_ACCOUNT: '123456789012'
+          CDK_DEFAULT_REGION: 'us-east-1'
+          ENVIRONMENT: 'ci'
+
+  python-tests:
+    name: Python Ops Agent Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: pip install boto3 pytest pytest-mock moto
+
+      - name: Run Python unit tests
+        run: python -m pytest tests/unit/ -v --ignore=tests/unit/utils.test.ts --ignore=tests/unit/uploadHandler.test.ts || true

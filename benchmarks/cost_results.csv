@@ -1,0 +1,1 @@
+image_id,status,rekognition_calls,dynamodb_writes,estimated_cost_usd
