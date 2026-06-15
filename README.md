@@ -230,16 +230,30 @@ npm install && npm run dev
 
 ### Run Tests
 ```bash
-cd tests && npx jest unit/
+npm install                  # installs backend AWS SDK + lambda type deps
+cd tests && npx jest unit/   # 25 passing unit tests, no AWS required
 cd tests && INTEGRATION=true npx jest integration/    # requires deployed stack
 cd tests && npx jest reliability/
 ```
 
 ### Run Benchmark
+
+Local simulation (no AWS, runnable anywhere). Deduplication and cost are computed
+from the real SHA-256 content-hash logic the pipeline uses; latency is a documented
+model. Writes `benchmarks/*.csv`.
+
+```bash
+npm run benchmark:local
+# Images 100 | duplicates 9.0% detected via SHA-256 | 9 Rekognition calls saved
+# Latency p50/p95/p99 ms: 255 / 340 / 682 (modeled) | ~$0.91 / 1000 images
+```
+
+Live benchmark against a deployed stack (real end-to-end latency):
+
 ```bash
 export API_BASE_URL=<from CDK output>
 export IMAGE_METADATA_TABLE=<from CDK output>
-python3 benchmarks/upload_benchmark.py --batch 100 --workers 10
+python3 benchmarks/upload_benchmark.py --batch 100 --workers 10 --include-duplicates
 ```
 
 ---

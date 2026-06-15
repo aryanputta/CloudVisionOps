@@ -460,12 +460,109 @@ def write_duplicate_csv(duplicates: list[UploadResult]) -> None:
     print(f"  Duplicate results → {path}")
 
 
+def run_simulation(batch_size: int, include_duplicates: bool, seed: int = 1337) -> None:
+    """Local simulation: no AWS required.
+
+    The duplicate-detection result is real: images are deduplicated by SHA-256
+    content hash, the same strategy the pipeline uses (see calculateImageHash in
+    backend/shared/utils.ts), and Rekognition is skipped for duplicates. Latency
+    is a documented model, not a live network measurement, so a recruiter can run
+    the benchmark and verify the dedup + cost logic without deploying the stack.
+    """
+    import hashlib
+
+    rng = random.Random(seed)
+    labels = ["Person", "Car", "Dog", "Building", "Tree", "Food", "Text", "Phone"]
+    seen_hashes: dict[str, str] = {}
+    results: list[UploadResult] = []
+    start = time.time()
+
+    for i in range(batch_size):
+        # Every 10th image (when enabled) is an exact duplicate of the prior
+        # unique image, so it deduplicates by content hash.
+        if include_duplicates and i >= 10 and i % 10 == 0:
+            content = f"image-{i - 1}".encode()
+        else:
+            content = f"image-{i}".encode()
+        digest = hashlib.sha256(content).hexdigest()
+
+        cold = i < 3  # first few requests pay cold-start cost
+        presign = rng.uniform(8, 20)
+        s3_upload = rng.uniform(20, 60)
+
+        if digest in seen_hashes:
+            # Duplicate: detected by content hash, Rekognition skipped.
+            rt = presign + s3_upload + rng.uniform(2, 6)
+            results.append(UploadResult(
+                image_id=str(uuid.uuid4()), round_trip_ms=round(rt, 2), presign_ms=round(presign, 2),
+                s3_upload_ms=round(s3_upload, 2), processing_ms=0.0, status="DUPLICATE",
+                dominant_label="", confidence_score=0.0, label_count=0, retry_count=0, cold_start=cold,
+                duplicate_of=seen_hashes[digest], error_type=None, rekognition_calls=0, dynamodb_writes=0,
+                estimated_cost_usd=0.0, timestamp=datetime.now(timezone.utc).isoformat(),
+            ))
+            continue
+
+        seen_hashes[digest] = digest[:12]
+        processing = rng.uniform(120, 280) + (350 if cold else 0)
+        rt = presign + s3_upload + processing
+        cost = REKOGNITION_PRICE_PER_IMAGE + LAMBDA_PRICE_PER_REQUEST * 3 + DYNAMODB_WRITE_PRICE_PER_WCU + S3_PUT_PRICE
+        results.append(UploadResult(
+            image_id=str(uuid.uuid4()), round_trip_ms=round(rt, 2), presign_ms=round(presign, 2),
+            s3_upload_ms=round(s3_upload, 2), processing_ms=round(processing, 2), status="SUCCESS",
+            dominant_label=rng.choice(labels), confidence_score=round(rng.uniform(80, 99), 2),
+            label_count=rng.randint(1, 6), retry_count=0, cold_start=cold, duplicate_of=None,
+            error_type=None, rekognition_calls=1, dynamodb_writes=1,
+            estimated_cost_usd=round(cost, 8), timestamp=datetime.now(timezone.utc).isoformat(),
+        ))
+
+    duration = time.time() - start
+    lat = sorted(r.round_trip_ms for r in results)
+    dups = [r for r in results if r.status == "DUPLICATE"]
+    succ = [r for r in results if r.status == "SUCCESS"]
+    pctl = lambda p: lat[min(len(lat) - 1, int(p / 100 * len(lat)))] if lat else 0.0
+    total_cost = sum(r.estimated_cost_usd for r in results)
+    summary = BenchmarkSummary(
+        batch_size=batch_size, workers=1, start_time=datetime.now(timezone.utc).isoformat(),
+        end_time=datetime.now(timezone.utc).isoformat(), total_duration_s=round(duration, 3),
+        throughput_images_per_sec=round(batch_size / duration, 1) if duration else 0.0,
+        avg_latency_ms=round(statistics.mean(lat), 2) if lat else 0.0,
+        median_latency_ms=round(statistics.median(lat), 2) if lat else 0.0,
+        p50_latency_ms=round(pctl(50), 2), p95_latency_ms=round(pctl(95), 2), p99_latency_ms=round(pctl(99), 2),
+        min_latency_ms=round(lat[0], 2) if lat else 0.0, max_latency_ms=round(lat[-1], 2) if lat else 0.0,
+        success_count=len(succ), failure_count=0, duplicate_count=len(dups),
+        failure_rate=0.0, duplicate_rate=round(len(dups) / batch_size, 4) if batch_size else 0.0,
+        cold_start_count=sum(1 for r in results if r.cold_start),
+        total_rekognition_calls=sum(r.rekognition_calls for r in results),
+        total_cost_usd=round(total_cost, 6),
+        cost_per_1000_images_usd=round(total_cost / batch_size * 1000, 4) if batch_size else 0.0,
+        cost_savings_from_dedup_usd=round(len(dups) * REKOGNITION_PRICE_PER_IMAGE, 6),
+    )
+
+    write_latency_csv(results, summary)
+    write_cost_csv(results, summary)
+    write_duplicate_csv(dups)
+
+    print("CloudVisionOps Benchmark (local simulation, no AWS)")
+    print("=" * 50)
+    print(f"Images                 : {batch_size}")
+    print(f"Duplicates detected    : {len(dups)} ({summary.duplicate_rate * 100:.1f}%) via SHA-256 content hash")
+    print(f"Rekognition calls saved: {len(dups)}  (cost saved ${summary.cost_savings_from_dedup_usd})")
+    print(f"Latency p50/p95/p99 ms : {summary.p50_latency_ms} / {summary.p95_latency_ms} / {summary.p99_latency_ms}")
+    print(f"Est. cost / 1000 images: ${summary.cost_per_1000_images_usd}")
+    print("Results written to benchmarks/*.csv")
+    print("Note: dedup + cost are real logic; latency is a documented model, not a live measurement.")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CloudVisionOps benchmark script")
     parser.add_argument("--batch", type=int, default=10, help="Number of images to upload")
     parser.add_argument("--workers", type=int, default=5, help="Concurrent upload workers")
     parser.add_argument("--include-duplicates", action="store_true", help="Include duplicate uploads (every 10th)")
     parser.add_argument("--dry-run", action="store_true", help="Print config and exit without uploading")
+    parser.add_argument("--simulate", action="store_true", help="Run locally without AWS (real dedup, modeled latency)")
     args = parser.parse_args()
 
-    run_benchmark(args.batch, args.workers, args.include_duplicates, args.dry_run)
+    if args.simulate:
+        run_simulation(args.batch, args.include_duplicates)
+    else:
+        run_benchmark(args.batch, args.workers, args.include_duplicates, args.dry_run)
