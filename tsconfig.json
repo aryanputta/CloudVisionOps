@@ -15,5 +15,6 @@
     "outDir": "dist",
     "rootDir": "."
   },
-  "exclude": ["node_modules", "cdk.out", "dist"]
+  "include": ["backend/**/*.ts", "infra/**/*.ts"],
+  "exclude": ["node_modules", "cdk.out", "dist", "frontend", "tests", "benchmarks"]
 }

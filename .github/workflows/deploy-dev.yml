@@ -1,8 +1,8 @@
 name: Deploy Dev
 
+# Manual-only: deploying provisions billable AWS resources and requires the
+# AWS_DEPLOY_ROLE_ARN secret (OIDC). Run from the Actions tab when AWS is configured.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       environment:
